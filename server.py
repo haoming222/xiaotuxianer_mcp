@@ -1,169 +1,177 @@
-"""
-================================================================================
- 小兔鲜儿 MCP Server — 封装 7 个电商核心 API (HTTP SSE 模式)
-================================================================================
-
- 功能概述:
-   将 Spring Boot 后端的商品搜索、详情、推荐、购物车、订单、支付、取消
-   共 7 个 REST API 封装为 MCP (Model Context Protocol) Tool，
-   让 Dify Agent 能通过标准 MCP 协议调用电商系统的全部操作。
-
- 运行方式:
-   conda activate python_mcp_server
-   python server.py
-
- Dify 配置:
-   MCP 类型选择 "SSE"，URL 填写: http://localhost:8000/sse
-
- 架构链路:
-   Dify Agent → MCP Protocol (SSE) → 本文件 → HTTP REST → Spring Boot 18080
-"""
-
 import json
 import os
 import time
 from typing import Any
 
-import httpx   # 异步 HTTP 客户端，用于调用 Spring Boot 后端 API
-import uvicorn  # ASGI 服务器，承载 Starlette 应用
-from mcp.server import Server
-from mcp.server.sse import SseServerTransport  # MCP 的 SSE 传输层实现
-from mcp.types import Tool, TextContent
-from starlette.applications import Starlette
-from starlette.routing import Mount, Route
+import httpx
+import uvicorn
+from fastapi import FastAPI, Request
 
-# ==============================================================================
-# 配置项 — 通过环境变量注入，方便 Docker/K8s 部署时动态修改
-# ==============================================================================
+from mcp.server import Server
+from mcp.server.sse import SseServerTransport
+from mcp.types import Tool, TextContent
+
+
+# ==========================================================
+# 基础配置
+# ==========================================================
+# Spring Boot 后端地址
+# 本地默认是 http://localhost:18080
+# 如果 MCP 跑在 Docker 里，可能要改成宿主机 IP 或容器网络地址
 SPRING_BOOT_URL = os.getenv("SPRING_BOOT_URL", "http://localhost:18080")
+
+# MCP 调用 Spring Boot 登录接口时使用的账号密码
 MCP_ACCOUNT = os.getenv("MCP_ACCOUNT", "zhm")
 MCP_PASSWORD = os.getenv("MCP_PASSWORD", "123456")
 
-# ==============================================================================
-# JWT Token 缓存机制
-# ==============================================================================
-# 问题：7 个 Tool 中有 5 个需要 Authorization 请求头，
-#       如果每次都重新登录获取 token，会产生大量冗余的 POST /login 请求
-# 方案：首次调用时登录获取 token，缓存到内存中，
-#       在 token 过期前 5 分钟自动刷新，避免过期边界问题
+# MCP Server 监听地址
+# 0.0.0.0 表示允许外部访问，方便 Dify Docker 容器连接
+MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
+MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
 
-_token: str | None = None                   # 当前缓存的 JWT token
-_token_expires_at: float = 0.0               # token 的过期时间戳（Unix 秒）
+
+# ==========================================================
+# JWT Token 缓存
+# ==========================================================
+# 多数 Spring Boot 接口需要 Authorization Token。
+#
+# 如果每次 Tool 调用都重新登录，会产生大量重复请求：
+#
+#   Dify Agent
+#       ↓
+#   MCP Tool
+#       ↓
+#   POST /login
+#       ↓
+#   调用业务接口
+#
+# 所以这里做内存缓存：
+#
+#   第一次调用：登录获取 Token
+#   后续调用：复用 Token
+#   接近过期：自动刷新 Token
+# ==========================================================
+_token: str | None = None
+_token_expires_at: float = 0.0
 
 
 async def ensure_token(client: httpx.AsyncClient) -> str:
     """
-    自动登录获取 JWT token，带缓存
-    每次需要认证的工具调用前触发，确保始终有有效 token 可用
+    获取一个可用的 JWT Token。
+
+    设计目的：
+    1. 避免每次调用工具都重新登录
+    2. 减少 Spring Boot 登录接口压力
+    3. 避免 Token 临近过期导致请求失败
+
+    当前策略：
+    - Token 认为有效期约 30 分钟
+    - 代码中按照 25 分钟刷新
+    - 预留 5 分钟安全缓冲
     """
     global _token, _token_expires_at
+
     now = time.time()
 
-    # 如果 token 还没到"危险期"（过期前 5 分钟），直接复用缓存
+    # Token 存在且还没进入过期危险期，直接复用
     if _token and now < _token_expires_at - 300:
         return _token
 
-    # 登录 → 获取新 token
-    resp = await client.post(f"{SPRING_BOOT_URL}/login", json={
-        "account": MCP_ACCOUNT,
-        "password": MCP_PASSWORD,
-    })
+    # Token 不存在或即将过期，重新登录
+    resp = await client.post(
+        f"{SPRING_BOOT_URL}/login",
+        json={
+            "account": MCP_ACCOUNT,
+            "password": MCP_PASSWORD,
+        },
+    )
     resp.raise_for_status()
+
     body = resp.json()
 
     if body.get("code") != 200:
         raise RuntimeError(f"登录失败: {body.get('msg')}")
 
     _token = body["data"]["token"]
-    # JWT 实际有效期 30 分钟，但我们 25 分钟后就刷新
-    # 留 5 分钟 buffer，防止 token 在两次调用之间恰好过期
     _token_expires_at = now + 25 * 60
+
     return _token
 
 
-# ==============================================================================
+# ==========================================================
 # MCP Server 实例
-# ==============================================================================
-# "xiaotuxianer-mcp" 是此 MCP Server 的唯一名称标识，
-# Dify 连接时会显示为工具提供方名称
+# ==========================================================
+# 这个名字会作为 MCP 服务名称展示给 Dify。
+#
+# 整体链路：
+#
+#   Dify Agent
+#       ↓
+#   MCP Protocol / SSE
+#       ↓
+#   xiaotuxianer-mcp
+#       ↓
+#   Spring Boot REST API
+# ==========================================================
 app = Server("xiaotuxianer-mcp")
 
 
-# ==============================================================================
-# 工具注册 — 告知 LLM 有哪些 Tool 可用及每个 Tool 的参数 schema
-# ==============================================================================
-# Dify Agent 会根据这里的 description 和 inputSchema 来理解
-# 每个工具的用途，并在合适时机调用
-
+# ==========================================================
+# 工具发现接口
+# ==========================================================
+# Dify 第一次连接 MCP Server 时，会调用 list_tools。
+#
+# 这里返回所有可用工具：
+# 1. 工具名称
+# 2. 工具描述
+# 3. 参数 schema
+#
+# Dify Agent 会根据这些描述判断什么时候调用哪个工具。
+# ==========================================================
 @app.list_tools()
 async def list_tools() -> list[Tool]:
-    """
-    返回可用的 MCP Tool 列表
-    此函数在 Dify 连接 MCP Server 时自动调用一次，用于工具发现
-    """
     return [
-        # ── Tool 1: 商品搜索 ──────────────────────────────────────────
-        # 对应后端接口: GET /goods/search?keyword=&page=&pageSize=
-        # 这是 5 步工作流的第一步：用户说"找羽绒服"，Agent 先调这个
         Tool(
             name="search_products",
-            description="按关键词搜索商品，返回商品列表（含名称、ID、价格、主图）",
+            description="按关键词搜索商品，返回商品列表（含名称、ID、价格、销量）",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "keyword": {
                         "type": "string",
-                        "description": "搜索关键词，如「羽绒服」「手机」",
+                        "description": "搜索关键词，如：羽绒服、手机、书包",
                     },
                     "page": {
                         "type": "integer",
-                        "description": "页码，默认1",
+                        "description": "页码，默认 1",
                         "default": 1,
                     },
                     "pageSize": {
                         "type": "integer",
-                        "description": "每页数量，默认10",
+                        "description": "每页数量，默认 10",
                         "default": 10,
                     },
                 },
                 "required": ["keyword"],
             },
         ),
-
-        # ── Tool 2: 商品详情 ──────────────────────────────────────────
-        # 对应后端接口: GET /goods/detail?id=
-        # 工作流第二步：Agent 拿到搜索结果的商品 ID 后，调这个查看详情
-        # 这是 LLM 做规格匹配的核心数据源：specs 数组 + skus 数组
         Tool(
             name="get_product_detail",
-            description=(
-                "获取单个商品完整信息："
-                "名称、价格、品牌、全部规格(颜色/尺码)、全部SKU(库存+单价)、主图"
-            ),
+            description="获取单个商品完整信息，包括规格、SKU、库存、价格、相似商品",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "goods_id": {
                         "type": "integer",
-                        "description": "商品ID",
+                        "description": "商品 ID",
                     },
                 },
                 "required": ["goods_id"],
             },
         ),
-
-        # ── Tool 3: 热门推荐 ──────────────────────────────────────────
-        # 对应后端接口: GET /hot/{type}?page=&pageSize=
-        # 工作流第三步：用热门推荐数据辅助决策
-        # 注意：此接口不需要 token（HotController 无拦截器），
-        # 所以 _get_trending_products 函数里没有调 ensure_token
         Tool(
             name="get_trending_products",
-            description=(
-                "获取热门推荐商品列表，支持4种类型: "
-                "preference(特惠推荐)、inVogue(爆款推荐)、"
-                "oneStop(一站买全)、new(新鲜好物)"
-            ),
+            description="获取热门推荐商品，支持 preference、inVogue、oneStop、new 四种类型",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -174,71 +182,54 @@ async def list_tools() -> list[Tool]:
                     },
                     "page": {
                         "type": "integer",
-                        "description": "页码，默认1",
+                        "description": "页码，默认 1",
                         "default": 1,
                     },
                     "pageSize": {
                         "type": "integer",
-                        "description": "每页数量，默认10",
+                        "description": "每页数量，默认 10",
                         "default": 10,
                     },
                 },
                 "required": ["type"],
             },
         ),
-
-        # ── Tool 4: 加入购物车 ────────────────────────────────────────
-        # 对应后端接口: POST /cart/add
-        # 需要传入 skuId（来自 get_product_detail 返回的 SKU 列表中某个 id）
-        # 后端会在此步骤自动校验库存是否充足
         Tool(
             name="add_to_cart",
-            description=(
-                "加入购物车。需提供商品ID、SKU ID、数量、规格摘要"
-                "（如「红色/XL」）。后端自动校验库存"
-            ),
+            description="加入购物车，需要商品 ID、SKU ID、数量、规格摘要",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "goodsId": {
                         "type": "integer",
-                        "description": "商品ID",
+                        "description": "商品 ID",
                     },
                     "skuId": {
                         "type": "string",
-                        "description": "SKU ID（来自 get_product_detail 返回的 skus 列表中某个 skuId）",
+                        "description": "SKU ID，来自商品详情接口返回的 skus",
                     },
                     "quantity": {
                         "type": "integer",
-                        "description": "购买数量，默认1",
+                        "description": "购买数量，默认 1",
                         "default": 1,
                     },
                     "specSummary": {
                         "type": "string",
-                        "description": "规格摘要描述，如「红色 / XL」，用于前端展示",
+                        "description": "规格摘要，如：红色 / XL",
                     },
                 },
                 "required": ["goodsId", "skuId", "specSummary"],
             },
         ),
-
-        # ── Tool 5: 创建订单 ──────────────────────────────────────────
-        # 对应后端接口: POST /order/create
-        # 工作流第四步：选定规格后直接下单
-        # 订单创建后会写入 Redis 键，5 分钟后过期触发自动取消（兜底机制）
         Tool(
             name="create_order",
-            description=(
-                "创建订单（下单）。传入商品ID、SKU ID、数量、规格摘要。"
-                "返回订单详情含总价和ID。"
-                "订单创建后5分钟内未支付将自动取消（Redis兜底）"
-            ),
+            description="创建订单，需要商品 ID、SKU ID、数量、规格摘要，返回订单信息",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "goodsId": {
                         "type": "integer",
-                        "description": "商品ID",
+                        "description": "商品 ID",
                     },
                     "skuId": {
                         "type": "string",
@@ -246,50 +237,40 @@ async def list_tools() -> list[Tool]:
                     },
                     "quantity": {
                         "type": "integer",
-                        "description": "购买数量，默认1",
+                        "description": "购买数量，默认 1",
                         "default": 1,
                     },
                     "specSummary": {
                         "type": "string",
-                        "description": "规格摘要，如「红色 / XL」",
+                        "description": "规格摘要，如：红色 / XL",
                     },
                 },
                 "required": ["goodsId", "skuId", "specSummary"],
             },
         ),
-
-        # ── Tool 6: 支付订单 ──────────────────────────────────────────
-        # 对应后端接口: PUT /order/pay/{id}
-        # 工作流第五步：确认支付
-        # 底层 SQL: UPDATE ... WHERE id=? AND account=? AND status=0
-        # 三重校验防止越权支付或重复扣款
         Tool(
             name="pay_order",
-            description="支付订单，将订单状态从「待支付」变为「已支付」。需提供订单ID",
+            description="支付订单，将订单状态从待支付变为已支付",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "order_id": {
                         "type": "integer",
-                        "description": "订单ID（create_order 返回的 orderId）",
+                        "description": "订单 ID",
                     },
                 },
                 "required": ["order_id"],
             },
         ),
-
-        # ── Tool 7: 取消订单 ──────────────────────────────────────────
-        # 对应后端接口: PUT /order/cancel/{id}
-        # 与自动取消（Redis 过期监听）互补，Agent 也可主动取消订单
         Tool(
             name="cancel_order",
-            description="手动取消订单，将订单状态从「待支付」变为「已取消」。需提供订单ID",
+            description="取消订单，将订单状态从待支付变为已取消",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "order_id": {
                         "type": "integer",
-                        "description": "订单ID",
+                        "description": "订单 ID",
                     },
                 },
                 "required": ["order_id"],
@@ -298,21 +279,27 @@ async def list_tools() -> list[Tool]:
     ]
 
 
-# ==============================================================================
-# 工具调用分发 — Dify Agent 调用 Tool 时的入口函数
-# ==============================================================================
-# 这是 MCP 协议的核心方法：Agent 传入 tool 名称 + 参数，
-# 我们需要执行对应的业务逻辑并返回结果
-
+# ==========================================================
+# 工具调用入口
+# ==========================================================
+# 当 Dify Agent 决定调用某个工具时，会进入这里。
+#
+# 例如：
+#
+#   用户：帮我找一件羽绒服
+#
+#   Dify Agent 判断应该调用：
+#   search_products({"keyword": "羽绒服"})
+#
+#   MCP Server 接收到后：
+#   call_tool("search_products", {"keyword": "羽绒服"})
+#
+# 然后这里再路由到 _search_products 函数。
+# ==========================================================
 @app.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    """
-    根据 tool 名称路由到对应的处理函数，统一错误处理包装
-    """
-    # 每个 HTTP 调用使用独立的 AsyncClient 实例
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
-            # ── 路由分发 ──
             if name == "search_products":
                 result = await _search_products(client, arguments)
             elif name == "get_product_detail":
@@ -328,12 +315,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             elif name == "cancel_order":
                 result = await _cancel_order(client, arguments)
             else:
-                # 未知工具名，返回错误提示
                 return [TextContent(type="text", text=f"未知工具: {name}")]
 
-            # 将 Python dict 转为格式化 JSON 字符串返回给 LLM
-            # ensure_ascii=False 保证中文不转义
-            # indent=2 让 LLM 更容易"读"懂 JSON 结构
+            # MCP Tool 返回的是文本内容
+            # 这里把 Python dict 转成 JSON 字符串，方便大模型理解
             return [
                 TextContent(
                     type="text",
@@ -342,7 +327,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             ]
 
         except httpx.HTTPStatusError as e:
-            # 后端返回了非 2xx 状态码（如 404、500）
+            # Spring Boot 返回非 2xx 状态码时进入这里
             return [
                 TextContent(
                     type="text",
@@ -350,46 +335,62 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 )
             ]
         except Exception as e:
-            # 其他未预期错误（网络超时、DNS 解析失败等）
-            return [TextContent(type="text", text=f"调用失败: {str(e)}")]
+            # 网络异常、JSON 解析异常、业务异常等进入这里
+            return [
+                TextContent(
+                    type="text",
+                    text=f"调用失败: {str(e)}",
+                )
+            ]
 
 
-# ==============================================================================
-# 各 Tool 的具体实现
-# ==============================================================================
-# 每个函数负责：
-#   1. 构造请求参数
-#   2. 调用 Spring Boot 后端 HTTP API
-#   3. 解析响应
-#   4. 精简数据（去掉 LLM 不需要的字段，节省 token 消耗）
-#   5. 返回结构化的 dict/json
-
-
+# ==========================================================
+# Tool 1：商品搜索
+# ==========================================================
 async def _search_products(client: httpx.AsyncClient, args: dict) -> dict:
     """
-    商品搜索 — 对应 GET /goods/search
-    按关键词模糊匹配商品名称，返回分页结果
-    返回字段裁剪：只保留 id/name/price/description/salesCount，
-    不返回完整的详情图/规格等（减少 LLM context 消耗）
+    商品搜索。
+
+    对应 Spring Boot 接口：
+
+        GET /goods/search
+
+    适合场景：
+
+        用户：帮我找羽绒服
+        用户：搜索一下手机
+        用户：有没有书包
+
+    注意：
+    这里不返回完整商品详情，只返回精简信息。
+    这样可以减少 LLM 上下文消耗，提高 Agent 判断效率。
     """
     keyword = args["keyword"]
     page = args.get("page", 1)
     page_size = args.get("pageSize", 10)
 
-    token = await ensure_token(client)  # 自动登录获取 JWT
+    token = await ensure_token(client)
 
     resp = await client.get(
         f"{SPRING_BOOT_URL}/goods/search",
-        params={"keyword": keyword, "page": page, "pageSize": page_size},
-        headers={"Authorization": token},
+        params={
+            "keyword": keyword,
+            "page": page,
+            "pageSize": page_size,
+        },
+        headers={
+            "Authorization": token,
+        },
     )
     resp.raise_for_status()
+
     body = resp.json()
 
     if body.get("code") != 200:
         return {"error": body.get("msg", "搜索失败")}
 
     data = body.get("data", {})
+
     return {
         "total": data.get("total", 0),
         "page": data.get("pageNum", page),
@@ -407,15 +408,32 @@ async def _search_products(client: httpx.AsyncClient, args: dict) -> dict:
     }
 
 
+# ==========================================================
+# Tool 2：商品详情
+# ==========================================================
 async def _get_product_detail(client: httpx.AsyncClient, args: dict) -> dict:
     """
-    商品详情 — 对应 GET /goods/detail?id=
-    这是 LLM 最关键的数据源，返回商品的完整信息：
-      - 基本信息：名称、价格、销量、评价数
-      - 规格维度：颜色有哪些、尺码有哪些（specs 数组）
-      - SKU 详情：每个规格组合对应的库存、单价、图片（skus 数组）
-      - 相似商品：用于推荐对比
-    后端会 join 10+ 张表，这里帮 LLM 把数据重组为更容易理解的结构
+    获取商品详情。
+
+    对应 Spring Boot 接口：
+
+        GET /goods/detail?id=xxx
+
+    这是 Agent 决策中非常关键的一步。
+
+    因为下单不能只知道商品 ID，
+    还必须知道具体 SKU ID。
+
+    例如：
+
+        用户：我要红色 XL 的那件
+
+    Agent 需要从 skus 里找到：
+        颜色 = 红色
+        尺码 = XL
+        库存 > 0
+
+    然后把对应 skuId 传给下单接口。
     """
     goods_id = args["goods_id"]
 
@@ -424,9 +442,12 @@ async def _get_product_detail(client: httpx.AsyncClient, args: dict) -> dict:
     resp = await client.get(
         f"{SPRING_BOOT_URL}/goods/detail",
         params={"id": goods_id},
-        headers={"Authorization": token},
+        headers={
+            "Authorization": token,
+        },
     )
     resp.raise_for_status()
+
     body = resp.json()
 
     if body.get("code") != 200:
@@ -434,98 +455,130 @@ async def _get_product_detail(client: httpx.AsyncClient, args: dict) -> dict:
 
     data = body.get("data", {})
 
-    # ── 重组 SKU 数据 ──
-    # 将 specs 数组扁平化为可读字符串，如 "颜色: 红色, 尺码: XL"
-    # LLM 可以直接读懂，不需要再解析嵌套数组
+    # 把 SKU 中的规格数组转换成人类更容易读懂的字符串
+    # 例如：
+    #   [{"name": "颜色", "valueName": "红色"}, {"name": "尺码", "valueName": "XL"}]
+    # 转成：
+    #   "颜色: 红色, 尺码: XL"
     skus = []
     for sku in data.get("skus", []):
         spec_names = ", ".join(
-            f"{s.get('name')}: {s.get('valueName')}" for s in sku.get("specs", [])
+            f"{s.get('name')}: {s.get('valueName')}"
+            for s in sku.get("specs", [])
         )
-        skus.append({
-            "skuId": sku.get("id"),           # SKU 主键，后续加购/下单需要传
-            "specs": spec_names,               # 规格描述，LLM 用于匹配
-            "price": sku.get("price"),         # 该规格组合的价格
-            "inventory": sku.get("inventory"), # 库存数量，用于判断能否购买
-            "picture": sku.get("picture"),     # 该规格对应的图片
-        })
 
-    # ── 重组规格维度 ──
-    # 从 specs 数组中提取"有哪些可选维度"
-    # 如: [{name: "颜色", values: ["红色", "蓝色"]}, {name: "尺码", values: ["S", "M", "XL"]}]
+        skus.append(
+            {
+                "skuId": sku.get("id"),
+                "specs": spec_names,
+                "price": sku.get("price"),
+                "inventory": sku.get("inventory"),
+                "picture": sku.get("picture"),
+            }
+        )
+
+    # 提取商品有哪些规格维度
+    # 例如：
+    #   颜色：红色、黑色、蓝色
+    #   尺码：S、M、L、XL
     specs_info = []
     for spec in data.get("specs", []):
-        specs_info.append({
-            "name": spec.get("name"),  # 维度名称，如"颜色"
-            "values": [v.get("name") for v in spec.get("values", [])],  # 可选值列表
-        })
+        specs_info.append(
+            {
+                "name": spec.get("name"),
+                "values": [
+                    v.get("name")
+                    for v in spec.get("values", [])
+                ],
+            }
+        )
 
-    # ── 精简相似商品 ──
-    # 只保留 id/name/price，不返回完整详情
+    # 相似商品只保留核心字段，避免上下文过大
     similar = [
-        {"id": sp.get("id"), "name": sp.get("name"), "price": sp.get("price")}
+        {
+            "id": sp.get("id"),
+            "name": sp.get("name"),
+            "price": sp.get("price"),
+        }
         for sp in data.get("similarProducts", [])
     ]
 
     return {
-        # 基本信息
         "id": data.get("id"),
         "name": data.get("name"),
         "price": data.get("price"),
         "oldPrice": data.get("oldPrice"),
         "description": data.get("description"),
-        # 统计数据
         "salesCount": data.get("salesCount"),
         "commentCount": data.get("commentCount"),
         "collectCount": data.get("collectCount"),
-        # 品牌 & 主图
         "brand": data.get("brand"),
         "mainPictures": data.get("mainPictures", []),
-        # 规格 & SKU（LLM 决策的核心）
         "specs": specs_info,
         "skus": skus,
-        # 相似商品推荐
         "similarProducts": similar,
     }
 
 
+# ==========================================================
+# Tool 3：热门推荐
+# ==========================================================
 async def _get_trending_products(client: httpx.AsyncClient, args: dict) -> dict:
     """
-    热门推荐 — 对应 GET /hot/{type}
-    支持 4 种推荐类型：
-      preference → 特惠推荐
-      inVogue    → 爆款推荐
-      oneStop    → 一站买全
-      new        → 新鲜好物
-    注意：此接口无需 token（HotController 路径不在拦截器范围）
+    获取热门推荐商品。
+
+    对应 Spring Boot 接口：
+
+        GET /hot/{type}
+
+    支持四种推荐类型：
+
+        preference  特惠推荐
+        inVogue     爆款推荐
+        oneStop     一站买全
+        new         新鲜好物
+
+    这个接口一般用于：
+    1. 用户不知道买什么
+    2. Agent 做主动推荐
+    3. 搜索结果为空时兜底推荐
     """
     hot_type = args["type"]
     page = args.get("page", 1)
     page_size = args.get("pageSize", 10)
 
-    # 注意：这里没有调 ensure_token，因为 /hot/** 不需要认证
+    # 假设 /hot/** 不需要登录
     resp = await client.get(
         f"{SPRING_BOOT_URL}/hot/{hot_type}",
-        params={"page": page, "pageSize": page_size},
+        params={
+            "page": page,
+            "pageSize": page_size,
+        },
     )
     resp.raise_for_status()
+
     body = resp.json()
 
     if body.get("code") != 200:
         return {"error": body.get("msg", "查询失败")}
 
     data = body.get("data", {})
-    # 扁平化：把 subtypes → goodsItems.list 展平为单一商品列表
+
+    # 后端返回可能是 subtypes 嵌套结构
+    # 这里将其拍平成一个商品列表，方便 LLM 阅读
     items = []
     for st in data.get("subtypes", []):
-        for item in st.get("goodsItems", {}).get("list", []):
-            items.append({
-                "id": item.get("id"),
-                "name": item.get("name"),
-                "price": item.get("price"),
-                "picture": item.get("picture"),
-                "description": item.get("description"),
-            })
+        goods_items = st.get("goodsItems", {})
+        for item in goods_items.get("list", []):
+            items.append(
+                {
+                    "id": item.get("id"),
+                    "name": item.get("name"),
+                    "price": item.get("price"),
+                    "picture": item.get("picture"),
+                    "description": item.get("description"),
+                }
+            )
 
     type_names = {
         "preference": "特惠推荐",
@@ -542,14 +595,26 @@ async def _get_trending_products(client: httpx.AsyncClient, args: dict) -> dict:
     }
 
 
+# ==========================================================
+# Tool 4：加入购物车
+# ==========================================================
 async def _add_to_cart(client: httpx.AsyncClient, args: dict) -> dict:
     """
-    加入购物车 — 对应 POST /cart/add
-    后端会校验：
-      1. skuId 是否属于该商品
-      2. 购买数量是否 ≤ 当前库存
-      3. goodsId 不为空
-    校验失败会返回具体错误信息
+    加入购物车。
+
+    对应 Spring Boot 接口：
+
+        POST /cart/add
+
+    必须传入：
+    1. goodsId
+    2. skuId
+    3. quantity
+    4. specSummary
+
+    注意：
+    skuId 一定要来自 get_product_detail 返回的 skus。
+    因为同一个商品可能有多个颜色和尺码组合。
     """
     token = await ensure_token(client)
 
@@ -563,28 +628,53 @@ async def _add_to_cart(client: httpx.AsyncClient, args: dict) -> dict:
     resp = await client.post(
         f"{SPRING_BOOT_URL}/cart/add",
         json=payload,
-        headers={"Authorization": token},
+        headers={
+            "Authorization": token,
+        },
     )
     resp.raise_for_status()
+
     body = resp.json()
 
     if body.get("code") != 200:
-        return {"success": False, "error": body.get("msg", "加入购物车失败")}
+        return {
+            "success": False,
+            "error": body.get("msg", "加入购物车失败"),
+        }
 
-    return {"success": True, "message": "已成功加入购物车"}
+    return {
+        "success": True,
+        "message": "已成功加入购物车",
+    }
 
 
+# ==========================================================
+# Tool 5：创建订单
+# ==========================================================
 async def _create_order(client: httpx.AsyncClient, args: dict) -> dict:
     """
-    创建订单 — 对应 POST /order/create
-    后端处理流程：
-      1. 参数校验（goodsId 不为空、quantity ≥ 1）
-      2. 查询商品和 SKU 信息，计算总价
-      3. 校验库存是否充足
-      4. INSERT 订单记录（状态=0 待支付）
-      5. 写入 Redis: order:auto_cancel:{orderId}，TTL=5分钟
-      6. Redis 键过期后由 RedisKeyExpirationListener 自动将状态改为"已取消"
-    返回订单详情，建议 LLM 提示用户 5 分钟内完成支付
+    创建订单。
+
+    对应 Spring Boot 接口：
+
+        POST /order/create
+
+    典型流程：
+
+        用户确认商品和规格
+              ↓
+        Agent 找到 skuId
+              ↓
+        调用 create_order
+              ↓
+        Spring Boot 校验库存
+              ↓
+        创建待支付订单
+              ↓
+        返回 orderId
+
+    如果你的后端做了 Redis 自动取消订单，
+    可以在这里提示用户 5 分钟内完成支付。
     """
     token = await ensure_token(client)
 
@@ -598,13 +688,19 @@ async def _create_order(client: httpx.AsyncClient, args: dict) -> dict:
     resp = await client.post(
         f"{SPRING_BOOT_URL}/order/create",
         json=payload,
-        headers={"Authorization": token},
+        headers={
+            "Authorization": token,
+        },
     )
     resp.raise_for_status()
+
     body = resp.json()
 
     if body.get("code") != 200:
-        return {"success": False, "error": body.get("msg", "下单失败")}
+        return {
+            "success": False,
+            "error": body.get("msg", "下单失败"),
+        }
 
     order = body.get("data", {})
 
@@ -616,121 +712,204 @@ async def _create_order(client: httpx.AsyncClient, args: dict) -> dict:
             "goodsName": order.get("goodsName"),
             "specSummary": order.get("specSummary"),
             "quantity": order.get("quantity"),
-            "price": str(order.get("price")),           # BigDecimal → String
-            "totalPrice": str(order.get("totalPrice")), # 总价 = 单价 × 数量
+            "price": str(order.get("price")),
+            "totalPrice": str(order.get("totalPrice")),
             "status": "待支付",
         },
     }
 
 
+# ==========================================================
+# Tool 6：支付订单
+# ==========================================================
 async def _pay_order(client: httpx.AsyncClient, args: dict) -> dict:
     """
-    支付订单 — 对应 PUT /order/pay/{id}
-    后端 SQL: UPDATE order_info SET status=1
-             WHERE id=? AND account=? AND status=0
-    三重校验：
-      1. id 匹配 —— 订单存在
-      2. account 匹配 —— 防止越权支付他人订单
-      3. status=0 —— 防止重复支付或支付已取消的订单
-    如果 affected rows = 0，说明上述条件之一不满足，返回失败
+    支付订单。
+
+    对应 Spring Boot 接口：
+
+        PUT /order/pay/{id}
+
+    后端一般应该校验：
+    1. 订单是否存在
+    2. 订单是否属于当前用户
+    3. 订单状态是否仍为待支付
+    4. 是否已经超时取消
     """
     token = await ensure_token(client)
+
     order_id = args["order_id"]
 
     resp = await client.put(
         f"{SPRING_BOOT_URL}/order/pay/{order_id}",
-        headers={"Authorization": token},
+        headers={
+            "Authorization": token,
+        },
     )
     resp.raise_for_status()
+
     body = resp.json()
 
     if body.get("code") != 200:
-        return {"success": False, "error": body.get("msg", "支付失败")}
+        return {
+            "success": False,
+            "error": body.get("msg", "支付失败"),
+        }
 
-    return {"success": True, "message": f"订单 {order_id} 已支付成功"}
+    return {
+        "success": True,
+        "message": f"订单 {order_id} 已支付成功",
+    }
 
 
+# ==========================================================
+# Tool 7：取消订单
+# ==========================================================
 async def _cancel_order(client: httpx.AsyncClient, args: dict) -> dict:
     """
-    手动取消订单 — 对应 PUT /order/cancel/{id}
-    与上面的支付逻辑对称，条件相同，只是 status 目标值不同：
-      status 0(待支付) → 2(已取消)
-    注意：
-      - 如果订单已被 Redis 自动取消，此操作会返回失败（status 已经是 2）
-      - 如果订单已支付（status=1），取消也会失败
+    取消订单。
+
+    对应 Spring Boot 接口：
+
+        PUT /order/cancel/{id}
+
+    可用于：
+    1. 用户主动取消
+    2. Agent 根据用户意图取消
+    3. 与 Redis 自动取消机制互补
     """
     token = await ensure_token(client)
+
     order_id = args["order_id"]
 
     resp = await client.put(
         f"{SPRING_BOOT_URL}/order/cancel/{order_id}",
-        headers={"Authorization": token},
+        headers={
+            "Authorization": token,
+        },
     )
     resp.raise_for_status()
+
     body = resp.json()
 
     if body.get("code") != 200:
-        return {"success": False, "error": body.get("msg", "取消失败")}
+        return {
+            "success": False,
+            "error": body.get("msg", "取消失败"),
+        }
 
-    return {"success": True, "message": f"订单 {order_id} 已取消"}
+    return {
+        "success": True,
+        "message": f"订单 {order_id} 已取消",
+    }
 
 
-# ==============================================================================
-# HTTP SSE 启动入口
-# ==============================================================================
-# MCP 协议支持两种传输方式：
-#   stdio — 进程间标准输入输出（适合本地命令行调用）
-#   SSE   — Server-Sent Events over HTTP（适合 Dify 等平台通过 URL 连接）
-# 这里使用 SSE 模式，Dify 通过 http://localhost:8000/sse 连接
-
-# 可被环境变量覆盖的 HTTP 配置
-MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
-MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
-
-# SseServerTransport 是 MCP 官方提供的 SSE 传输实现
-# "/messages/" 路径用于 POST 接收客户端发来的初始化消息和 tool 调用请求
+# ==========================================================
+# MCP SSE 传输层
+# ==========================================================
+# MCP 常见传输方式：
+#
+# 1. stdio
+#    常用于 Claude Desktop、Cursor 本地插件
+#
+# 2. SSE
+#    常用于 Dify 这种通过 URL 连接的 Agent 平台
+#
+# 当前项目使用 SSE：
+#
+#   Dify
+#     ↓ GET /sse
+#   建立 SSE 长连接
+#     ↓ POST /messages/
+#   发送 MCP 初始化消息和工具调用消息
+#
+# "/messages/" 是 Dify 后续发送 MCP 消息的地址。
+# ==========================================================
 sse = SseServerTransport("/messages/")
 
 
-async def handle_sse(request):
+async def handle_sse(request: Request):
     """
-    处理 SSE 连接请求
-    Dify Agent 向 /sse 发起 GET 请求后，此函数建立长连接，
-    通过 SSE 通道接收 tool 调用并进行响应
+    SSE 连接入口。
+
+    Dify 连接 MCP Server 时，会请求：
+
+        GET /sse
+
+    建立连接后，MCP 协议内部会使用 read_stream 和 write_stream
+    进行消息收发。
+
+    注意：
+    request 必须标注为 Request 类型。
+    否则 FastAPI 会把 request 当成普通查询参数，
+    导致访问 /sse 返回 422 Unprocessable Entity。
     """
     async with sse.connect_sse(
-        request.scope, request.receive, request._send
+        request.scope,
+        request.receive,
+        request._send,
     ) as (read_stream, write_stream):
-        # 将 SSE 通道包装为 MCP Server 所需的 read/write stream
         await app.run(
-            read_stream, write_stream, app.create_initialization_options()
+            read_stream,
+            write_stream,
+            app.create_initialization_options(),
         )
 
 
+# ==========================================================
+# 应用启动入口
+# ==========================================================
 def main():
     """
-    构建 Starlette 应用并启动 uvicorn
+    启动 FastAPI + MCP Server。
 
-    注册两个路由：
-      GET  /sse         → SSE 连接端点（Dify 连接此 URL）
-      POST /messages/   → MCP 消息端点（tool 调用通过此路径）
+    对外暴露两个关键路由：
+
+        GET  /sse
+            Dify 连接 MCP Server 的入口
+
+        POST /messages/
+            Dify 发送 MCP 初始化消息和 Tool 调用消息的入口
+
+    Dify 配置方式：
+
+        MCP 类型：SSE
+        URL：http://host.docker.internal:8000/sse
+
+    如果 Dify 和 MCP 不在同一台机器，
+    则需要把 host.docker.internal 换成 MCP 所在机器的 IP。
     """
-    starlette_app = Starlette(
-        routes=[
-            # SSE 长连接端点 — Dify 配置中填写的 URL
-            Route("/sse", endpoint=handle_sse),
-
-            # MCP 消息处理 — 注意使用 Mount 而非 Route
-            # 因为 sse.handle_post_message 是 ASGI app (scope, receive, send)
-            # 不是普通的 HTTP request handler
-            Mount("/messages/", app=sse.handle_post_message),
-        ]
+    fastapi_app = FastAPI(
+        title="小兔鲜儿 MCP Server",
+        version="1.0.0",
     )
-    uvicorn.run(starlette_app, host=MCP_HOST, port=MCP_PORT)
+
+    # 注册 SSE 长连接端点
+    fastapi_app.add_api_route(
+        "/sse",
+        endpoint=handle_sse,
+        methods=["GET"],
+    )
+
+    # 挂载 MCP 消息处理端点
+    fastapi_app.mount(
+        "/messages/",
+        app=sse.handle_post_message,
+    )
+
+    print("=" * 60)
+    print("小兔鲜儿 MCP Server 启动成功")
+    print(f"监听地址: http://{MCP_HOST}:{MCP_PORT}")
+    print(f"SSE 端点: http://localhost:{MCP_PORT}/sse")
+    print(f"Spring Boot 后端地址: {SPRING_BOOT_URL}")
+    print("=" * 60)
+
+    uvicorn.run(
+        fastapi_app,
+        host=MCP_HOST,
+        port=MCP_PORT,
+    )
 
 
 if __name__ == "__main__":
-    print(f"  小兔鲜儿 MCP Server 启动在 http://{MCP_HOST}:{MCP_PORT}")
-    print(f"  SSE 端点: http://localhost:{MCP_PORT}/sse")
-    print(f"  后端地址: {SPRING_BOOT_URL}")
     main()
